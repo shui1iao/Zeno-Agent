@@ -32,14 +32,14 @@ Linux / macOS：
 
 ```bash
 set -o pipefail
-curl -fsSL https://zeno.shuijiao.de/agent/install.sh | sudo env \
+curl -fsSL https://zeno.siaoz.si/agent/install.sh | sudo env \
   ZENO_CONTROLLER_URL=https://zeno.example.com \
   ZENO_NODE_ID=<node-id> \
   ZENO_ENROLLMENT_TOKEN=<one-time-enrollment-token> \
   bash
 ```
 
-Windows：使用管理员 PowerShell 执行后台生成的 `powershell -NoProfile ...` 命令。它会从 `https://zeno.shuijiao.de/agent/install.ps1` 下载安装脚本，安装 `zeno-agent.exe`，并注册 `zeno-agent` Windows 服务。
+Windows：使用管理员 PowerShell 执行后台生成的 `powershell -NoProfile ...` 命令。它会从 `https://zeno.siaoz.si/agent/install.ps1` 下载安装脚本，安装 `zeno-agent.exe`，并注册 `zeno-agent` Windows 服务。
 
 安装器会下载 Release 中的 `SHA256SUMS` 并校验 Agent 压缩包，且默认使用 Release Sigstore bundle（旧 Release 缺少 bundle 时使用 GitHub attestation API）验证构建来源和 workflow identity。每个 Linux、macOS、Windows 架构归档均提供对应的 CycloneDX SBOM，并一起纳入 checksum 与 provenance。下载、哈希或 provenance 验证失败时会在替换当前版本前安全停止。仅在明确接受只做哈希校验的风险时，才可设置 `ZENO_VERIFY_ATTESTATION=false`。
 
