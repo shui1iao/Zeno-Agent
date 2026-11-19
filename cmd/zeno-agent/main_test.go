@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -509,3 +510,82 @@ func TestRunAgentStartsLivenessLoopsWhileInitialProbeUploadIsBlocked(t *testing.
 		t.Fatal("runAgent did not wait for and stop its workers promptly")
 	}
 }
+
+func TestProbeUploaderLoggingDistinguishesRetryable502FromTerminalQuarantine(t *testing.T) {
+	now := time.Date(2026, 7, 17, 13, 0, 0, 0, time.UTC)
+	var step atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if step.Add(1) == 1 {
+			http.Error(w, "upstream 502", http.StatusBadGateway)
+			return
+		}
+		http.Error(w, "forbidden", http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	clockMu := sync.Mutex{}
+	clock := now
+	nowFn := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return clock
+	}
+	spool, err := agent.NewProbeSpool(t.TempDir(), agent.ProbeSpoolOptions{
+		Now:       nowFn,
+		FreeBytes: func(string) (uint64, error) { return 1 << 40, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := spool.Enqueue([]agent.ProbeRound{{
+		RoundID:  "log-check-round",
+		TargetID: "t1",
+		TS:       now,
+		Type:     "http_get",
+		Samples:  []agent.ProbeSample{{Seq: 1, Success: true}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	logCh := make(chan string, 4)
+	opts := newProbeUploaderOptions(nil, func(format string, args ...any) {
+		logCh <- fmt.Sprintf(format, args...)
+	})
+	opts.Now = nowFn
+	opts.Jitter = func(cap time.Duration) time.Duration { return cap }
+	opts.PollInterval = 5 * time.Millisecond
+
+	uploader := agent.NewProbeUploader(spool, newAgentTestClient(server.URL, "node-a", "token"), opts)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- uploader.Run(ctx) }()
+
+	select {
+	case line := <-logCh:
+		if !strings.Contains(line, "warning:") || !strings.Contains(line, "502") || !strings.Contains(line, "retained in spool") {
+			t.Fatalf("502 retry log = %q, want warning with 502 and retained in spool", line)
+		}
+		if strings.Contains(line, "quarantined") || strings.Contains(line, "terminally rejected") {
+			t.Fatalf("502 retry log falsely claimed quarantine: %q", line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for 502 retry warning log")
+	}
+
+	clockMu.Lock()
+	clock = clock.Add(2 * time.Second)
+	clockMu.Unlock()
+
+	select {
+	case line := <-logCh:
+		if !strings.Contains(line, "terminally rejected and quarantined") || !strings.Contains(line, "403") {
+			t.Fatalf("403 terminal log = %q, want terminally rejected and quarantined with 403", line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for 403 quarantine log")
+	}
+	cancel()
+	<-done
+}
+

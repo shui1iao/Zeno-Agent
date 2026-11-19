@@ -27,8 +27,5 @@ func diskUsageForPath(path string) (used int64, total int64) {
 	if err := unix.Statfs(path, &stat); err != nil {
 		return 0, 0
 	}
-	total = int64(stat.Blocks) * int64(stat.Bsize)
-	free := int64(stat.Bfree) * int64(stat.Bsize)
-	used = nonNegativeInt64(total - free)
-	return used, total
+	return statfsAvailableDiskUsage(uint64(stat.Blocks), uint64(stat.Bavail), int64(stat.Bsize))
 }

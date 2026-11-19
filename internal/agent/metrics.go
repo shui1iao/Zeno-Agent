@@ -412,6 +412,12 @@ var defaultExcludedInterfacePrefixes = []string{
 	"npcap",
 	"bluetooth",
 	"zt",
+	"wg",
+	"podman",
+	"lxc",
+	"lxd",
+	"cilium",
+	"nebula",
 }
 
 func readNetworkTotals(allowlist map[string]struct{}) (networkTotals, error) {
@@ -666,4 +672,30 @@ func nonNegativeInt64(value int64) int64 {
 		return 0
 	}
 	return value
+}
+
+func statfsAvailableDiskUsage(blocks, bavail uint64, bsize int64) (used int64, total int64) {
+	if bsize <= 0 || blocks == 0 {
+		return 0, 0
+	}
+	blockSize := uint64(bsize)
+	totalBytes := blocks * blockSize
+	if totalBytes/blockSize != blocks || totalBytes > uint64(maxInt64) {
+		total = maxInt64
+	} else {
+		total = int64(totalBytes)
+	}
+	availBlocks := bavail
+	if availBlocks > blocks {
+		availBlocks = blocks
+	}
+	availBytes := availBlocks * blockSize
+	var avail int64
+	if availBytes/blockSize != availBlocks || availBytes > uint64(total) {
+		avail = total
+	} else {
+		avail = int64(availBytes)
+	}
+	used = nonNegativeInt64(total - avail)
+	return used, total
 }

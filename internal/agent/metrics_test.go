@@ -268,7 +268,11 @@ func TestCollectStateRebasesSpeedWhenCounterSourceChanges(t *testing.T) {
 }
 
 func TestIncludeNetworkInterfaceFiltersVirtualDefaults(t *testing.T) {
-	for _, name := range []string{"lo", "docker0", "vethabc", "br-123", "tun0", "utun1", "tailscale0", "kube-ipvs0", "vmbr0", "tap1", "cni0", "flannel.1", "cali123", "virbr0"} {
+	for _, name := range []string{
+		"lo", "docker0", "vethabc", "br-123", "tun0", "utun1", "tailscale0",
+		"kube-ipvs0", "vmbr0", "tap1", "cni0", "flannel.1", "cali123", "virbr0",
+		"wg0", "wg-mullvad", "podman0", "podman1", "lxcbr0", "lxc0", "lxdbr0", "cilium_host", "cilium_net", "nebula1",
+	} {
 		if includeNetworkInterface(name, nil) {
 			t.Fatalf("interface %s included by default, want excluded", name)
 		}
@@ -337,5 +341,20 @@ func TestWindowsLoadAveragesAreNotSyntheticCPU(t *testing.T) {
 	load1, load5, load15 := windowsLoadAverages(87.5, 16)
 	if load1 != 0 || load5 != 0 || load15 != 0 {
 		t.Fatalf("windows load averages = %v/%v/%v, want zero because Windows has no Unix load average", load1, load5, load15)
+	}
+}
+
+func TestStatfsAvailableDiskUsageUsesBavailAndPreventsUnderflow(t *testing.T) {
+	used, total := statfsAvailableDiskUsage(1000, 350, 4096)
+	if total != 1000*4096 || used != 650*4096 {
+		t.Fatalf("statfsAvailableDiskUsage = used %d total %d, want %d/%d", used, total, 650*4096, 1000*4096)
+	}
+	// If filesystem reports bavail > blocks, used must clamp at 0 instead of underflowing.
+	used, total = statfsAvailableDiskUsage(100, 120, 4096)
+	if total != 100*4096 || used != 0 {
+		t.Fatalf("statfsAvailableDiskUsage(bavail>blocks) = used %d total %d, want 0/%d", used, total, 100*4096)
+	}
+	if used, total := statfsAvailableDiskUsage(0, 10, 4096); used != 0 || total != 0 {
+		t.Fatalf("statfsAvailableDiskUsage(zero blocks) = %d/%d, want 0/0", used, total)
 	}
 }

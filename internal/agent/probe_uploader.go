@@ -29,6 +29,9 @@ type ProbeUploaderOptions struct {
 	Now          func() time.Time
 	Jitter       func(time.Duration) time.Duration
 	PollInterval time.Duration
+	// OnRetry is called after a retryable HTTP or transport failure has been
+	// retained in the spool with a scheduled next retry time.
+	OnRetry func(context.Context, *ProbeUploadRetryError)
 	// OnRejected is called after a terminal response has been durably moved to
 	// quarantine. It is intended for bounded reactions such as refreshing probe
 	// config after stale_probe_config; retryable outcomes never invoke it.
@@ -44,6 +47,7 @@ type ProbeUploader struct {
 	now          func() time.Time
 	jitter       func(time.Duration) time.Duration
 	pollInterval time.Duration
+	onRetry      func(context.Context, *ProbeUploadRetryError)
 	onRejected   func(context.Context, error)
 	mu           sync.Mutex
 }
@@ -130,6 +134,7 @@ func NewProbeUploader(spool *ProbeSpool, client *Client, options ProbeUploaderOp
 		now:          now,
 		jitter:       jitter,
 		pollInterval: pollInterval,
+		onRetry:      options.OnRetry,
 		onRejected:   options.OnRejected,
 	}
 }
@@ -222,13 +227,19 @@ func (u *ProbeUploader) Run(ctx context.Context) error {
 			// HTTP outcomes and scheduled transport retries have already moved
 			// or retry-gated the item. Local spool/client failures have not and
 			// must stop the runner rather than spin on the same due item.
-			var statusErr *AgentAPIStatusError
 			var retryErr *ProbeUploadRetryError
-			if !errors.As(err, &statusErr) && !errors.As(err, &retryErr) {
-				return err
-			}
-			if retryErr == nil && u.onRejected != nil {
-				u.onRejected(ctx, err)
+			if errors.As(err, &retryErr) {
+				if u.onRetry != nil {
+					u.onRetry(ctx, retryErr)
+				}
+			} else {
+				var statusErr *AgentAPIStatusError
+				if !errors.As(err, &statusErr) {
+					return err
+				}
+				if u.onRejected != nil {
+					u.onRejected(ctx, err)
+				}
 			}
 		}
 		if worked {

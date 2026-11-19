@@ -177,27 +177,7 @@ func runAgent(ctx context.Context, cfg config, client *agent.Client, collector *
 		}
 		return refreshProbeTargets(ctx, client, probeManager, requestedVersion)
 	}
-	probeUploader := agent.NewProbeUploader(probeSpool, client, agent.ProbeUploaderOptions{
-		OnRejected: func(uploadCtx context.Context, uploadErr error) {
-			var staleErr *agent.ProbeUploadStaleError
-			if errors.As(uploadErr, &staleErr) {
-				refreshCtx, cancelRefresh := context.WithTimeout(uploadCtx, probeConfigRefreshTimeout)
-				if _, refreshErr := refreshProbeConfig(refreshCtx, 0); refreshErr != nil && uploadCtx.Err() == nil {
-					log.Printf("stale probe result was quarantined; config refresh failed: %v", refreshErr)
-				} else if uploadCtx.Err() == nil {
-					log.Printf("stale probe result was quarantined and probe config refreshed")
-				}
-				cancelRefresh()
-				return
-			}
-			var roundConflict *agent.ProbeUploadRoundConflictError
-			if errors.As(uploadErr, &roundConflict) {
-				log.Printf("conflicting probe round was quarantined; manual diagnosis may be required")
-				return
-			}
-			log.Printf("probe result was terminally rejected and quarantined: %v", uploadErr)
-		},
-	})
+	probeUploader := agent.NewProbeUploader(probeSpool, client, newProbeUploaderOptions(refreshProbeConfig, log.Printf))
 
 	if err := reportHeartbeat(ctx, client, cfg.Version); err != nil {
 		log.Printf("initial heartbeat failed: %v", err)
@@ -338,6 +318,47 @@ func runProbeLoop(ctx context.Context, spool *agent.ProbeSpool, manager *probeTa
 		return
 	}
 	runPeriodicWithTimeout(ctx, probeRunLoopInterval, maxProbeRunLoopTimeout(), call, "probe report")
+}
+
+func newProbeUploaderOptions(refreshProbeConfig func(context.Context, int64) (int64, error), logf func(string, ...any)) agent.ProbeUploaderOptions {
+	if logf == nil {
+		logf = log.Printf
+	}
+	logRetryWarning := func(uploadCtx context.Context, retryErr *agent.ProbeUploadRetryError) {
+		if retryErr == nil || uploadCtx.Err() != nil {
+			return
+		}
+		logf("warning: probe upload failed (attempt %d, next retry at %s): %v; retained in spool", retryErr.Attempt, retryErr.NextAt.UTC().Format(time.RFC3339), retryErr)
+	}
+	return agent.ProbeUploaderOptions{
+		OnRetry: logRetryWarning,
+		OnRejected: func(uploadCtx context.Context, uploadErr error) {
+			var retryErr *agent.ProbeUploadRetryError
+			if errors.As(uploadErr, &retryErr) {
+				logRetryWarning(uploadCtx, retryErr)
+				return
+			}
+			var staleErr *agent.ProbeUploadStaleError
+			if errors.As(uploadErr, &staleErr) {
+				if refreshProbeConfig != nil {
+					refreshCtx, cancelRefresh := context.WithTimeout(uploadCtx, probeConfigRefreshTimeout)
+					if _, refreshErr := refreshProbeConfig(refreshCtx, 0); refreshErr != nil && uploadCtx.Err() == nil {
+						logf("stale probe result was quarantined; config refresh failed: %v", refreshErr)
+					} else if uploadCtx.Err() == nil {
+						logf("stale probe result was quarantined and probe config refreshed")
+					}
+					cancelRefresh()
+				}
+				return
+			}
+			var roundConflict *agent.ProbeUploadRoundConflictError
+			if errors.As(uploadErr, &roundConflict) {
+				logf("conflicting probe round was quarantined; manual diagnosis may be required")
+				return
+			}
+			logf("probe result was terminally rejected and quarantined: %v", uploadErr)
+		},
+	}
 }
 
 func runProbeUploader(ctx context.Context, uploader *agent.ProbeUploader) {

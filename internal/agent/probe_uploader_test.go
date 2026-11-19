@@ -375,6 +375,109 @@ func TestProbeUploaderRunStopsWhileIdleOnContextCancellation(t *testing.T) {
 	}
 }
 
+func TestProbeUploaderRunDistinguishesRetryable502AndTimeoutFromTerminalQuarantine(t *testing.T) {
+	now := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	var step atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch step.Add(1) {
+		case 1:
+			http.Error(w, "upstream bad gateway", http.StatusBadGateway)
+		case 2:
+			http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
+		default:
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		}
+	}))
+	defer server.Close()
+
+	clockMu := sync.Mutex{}
+	clock := now
+	nowFn := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return clock
+	}
+	advanceClock := func(d time.Duration) {
+		clockMu.Lock()
+		clock = clock.Add(d)
+		clockMu.Unlock()
+	}
+
+	spool := newTestProbeSpool(t, nowFn)
+	id, err := spool.Enqueue([]ProbeRound{testSpoolRound(now, "retry-then-quarantine")})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	retryCh := make(chan *ProbeUploadRetryError, 4)
+	rejectedCh := make(chan error, 4)
+	uploader := NewProbeUploader(spool, newTestClient(server.URL, "node", "token"), ProbeUploaderOptions{
+		Now:          nowFn,
+		Jitter:       func(cap time.Duration) time.Duration { return cap },
+		PollInterval: 5 * time.Millisecond,
+		OnRetry: func(_ context.Context, retryErr *ProbeUploadRetryError) {
+			retryCh <- retryErr
+		},
+		OnRejected: func(_ context.Context, rejectErr error) {
+			rejectedCh <- rejectErr
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- uploader.Run(ctx) }()
+
+	// Attempt 1 -> HTTP 502: must invoke OnRetry (NOT OnRejected) and stay in spool.
+	select {
+	case got := <-retryCh:
+		if got.StatusCode != http.StatusBadGateway || got.Attempt != 1 {
+			t.Fatalf("first retry callback = %+v, want 502 attempt 1", got)
+		}
+	case err := <-rejectedCh:
+		t.Fatalf("502 retryable response unexpectedly triggered OnRejected: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for 502 retry callback")
+	}
+	if entries, err := os.ReadDir(spool.quarantineDir); err != nil || len(entries) != 0 {
+		t.Fatalf("502 item moved to quarantine = %v, %v", entries, err)
+	}
+	if item, err := spool.Load(id); err != nil || item == nil {
+		t.Fatalf("502 item missing from pending spool: %#v, %v", item, err)
+	}
+
+	// Attempt 2 -> HTTP 503: still retryable, OnRetry only.
+	advanceClock(2 * time.Second)
+	select {
+	case got := <-retryCh:
+		if got.StatusCode != http.StatusServiceUnavailable || got.Attempt != 2 {
+			t.Fatalf("second retry callback = %+v, want 503 attempt 2", got)
+		}
+	case err := <-rejectedCh:
+		t.Fatalf("503 retryable response unexpectedly triggered OnRejected: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for 503 retry callback")
+	}
+
+	// Attempt 3 -> HTTP 401: terminal rejection, moved to quarantine and OnRejected invoked.
+	advanceClock(5 * time.Second)
+	select {
+	case got := <-rejectedCh:
+		if !isAgentAPIStatus(got, http.StatusUnauthorized) {
+			t.Fatalf("terminal rejection error = %v, want 401 status error", got)
+		}
+	case retryErr := <-retryCh:
+		t.Fatalf("401 terminal response unexpectedly triggered OnRetry: %+v", retryErr)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for 401 rejection callback")
+	}
+	if entries, err := os.ReadDir(spool.quarantineDir); err != nil || len(entries) != 1 {
+		t.Fatalf("401 terminal item quarantine entries = %v, %v; want 1", entries, err)
+	}
+	cancel()
+	<-done
+}
+
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
